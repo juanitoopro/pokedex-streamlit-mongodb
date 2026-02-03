@@ -19,44 +19,90 @@ def ensure_indexes():
     col.create_index([("pokemon_id", ASCENDING)], unique=True)
     col.create_index([("types", ASCENDING)])
 
-def fetch_pokemon(pokemon_id: int) -> dict:
-    url = f"https://pokeapi.co/api/v2/pokemon/ditto/{pokemon_id}"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    p = r.json()
+import time
+import requests
 
-    doc = {
-        "pokemon_id": p["id"],
-        "name": p["name"],
-        "height": p["height"],
-        "weight": p["weight"],
-        "base_experience": p.get("base_experience"),
-        "types": [t["type"]["name"] for t in p["types"]],
-        "stats": {s["stat"]["name"]: s["base_stat"] for s in p["stats"]},
-        "sprite": p["sprites"]["front_default"],
-        "updated_at": None,
-    }
-    return doc
+def fetch_pokemon(pokemon_id: int) -> dict:
+    url = f"https://pokeapi.co/api/v2/pokemon/{pokemon_id}"
+    last_status = None
+
+    for attempt in range(5):  # 5 intentos
+        r = requests.get(url, timeout=20)
+        last_status = r.status_code
+
+        # OK
+        if r.status_code == 200:
+            p = r.json()
+            return {
+                "pokemon_id": p["id"],
+                "name": p["name"],
+                "height": p["height"],
+                "weight": p["weight"],
+                "base_experience": p.get("base_experience"),
+                "types": [t["type"]["name"] for t in p["types"]],
+                "stats": {s["stat"]["name"]: s["base_stat"] for s in p["stats"]},
+                "sprite": p["sprites"]["front_default"],
+                "updated_at": None,
+            }
+
+        # Rate limit o errores temporales: reintentar con backoff
+        if r.status_code in (429, 500, 502, 503, 504):
+            wait = 1.5 * (attempt + 1)
+            time.sleep(wait)
+            continue
+
+        # Otros errores (404, 400, etc.) -> romper y lanzar error claro
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            raise requests.HTTPError(
+                f"PokeAPI fallo: status={r.status_code}, url={url}, body={r.text[:120]}"
+            ) from e
+
+    # si agota reintentos
+    raise requests.HTTPError(f"PokeAPI fallo tras reintentos: status={last_status}, url={url}")
+
 
 #  insertar datos
 def insert_many_from_pokeapi(start_id: int, end_id: int):
-    ensure_indexes()
-    inserted, skipped = 0, 0
+    if start_id < 1 or end_id < start_id:
+        raise ValueError("Rango inválido")
+
+    inserted = 0
+    skipped_existing = 0
+    failed = 0
+    failed_ids = []
 
     for pid in range(start_id, end_id + 1):
-        doc = fetch_pokemon(pid)
-        # upsert: si existe, lo actualiza; si no, lo inserta
-        res = col.update_one(
-            {"pokemon_id": doc["pokemon_id"]},
-            {"$setOnInsert": doc},
-            upsert=True
-        )
-        if res.upserted_id:
-            inserted += 1
-        else:
-            skipped += 1
+        try:
+            doc = fetch_pokemon(pid)
 
-    return {"inserted": inserted, "skipped_existing": skipped}
+            res = col.update_one(
+                {"pokemon_id": doc["pokemon_id"]},
+                {"$setOnInsert": doc},
+                upsert=True
+            )
+
+            if res.upserted_id is not None:
+                inserted += 1
+            else:
+                skipped_existing += 1
+
+        except Exception as e:
+            failed += 1
+            failed_ids.append(pid)
+            print(f"Error importando pokemon_id={pid}: {e}")
+
+        # evitar rate-limit de PokeAPI
+        time.sleep(0.25)
+
+    return {
+        "inserted": inserted,
+        "skipped_existing": skipped_existing,
+        "failed": failed,
+        "failed_ids": failed_ids
+    }
+
 
 # búsqueda (filtros)
 def search_pokemons(
@@ -121,3 +167,4 @@ def drop_collection():
 def drop_database():
     client.drop_database(DB_NAME)
     return True
+
